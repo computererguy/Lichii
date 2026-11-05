@@ -99,8 +99,10 @@ class Game(
     }
 
     companion object {
+        // Matches the desktop's supported_file_extensions (qt_common.cpp): "nup" is the Switch 2
+        // package format, without it the game folder scan skipped every Switch 2 dump.
         val extensions: Set<String> = HashSet(
-            listOf("xci", "nsp", "nca", "nro", "nsz", "xcz")
+            listOf("xci", "nsp", "nca", "nro", "nsz", "xcz", "nup")
         )
     }
 }

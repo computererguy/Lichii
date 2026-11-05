@@ -77,7 +77,8 @@ jboolean Java_org_yuzu_yuzu_1emu_utils_GameMetadata_getIsValid(JNIEnv* env, jobj
             if (file_type == Loader::FileType::Unknown || file_type == Loader::FileType::Error)
                 return false;
             if ((file_type == Loader::FileType::NSP || file_type == Loader::FileType::XCI ||
-                 file_type == Loader::FileType::NSZ || file_type == Loader::FileType::XCZ) &&
+                 file_type == Loader::FileType::NSZ || file_type == Loader::FileType::XCZ ||
+                 file_type == Loader::FileType::NUP) &&
                 !Loader::IsBootableGameContainer(file, file_type))
                 return false;
             u64 program_id = 0;
