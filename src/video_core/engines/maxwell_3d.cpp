@@ -1287,6 +1287,22 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]};
         FrontNoteCbWrite(split, fs, memory_writes, report, 16);
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) &&
+        VideoCommon::Nx2AcquireQueuedEnabled()) {
+        // A payload release (ProcessQueryGet) is queued now: acquires it meets need not drain.
+        Regs::ReportSemaphore report{};
+        report.address_high = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)];
+        report.address_low = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+        report.query.raw = value;
+        if (report.query.operation == Regs::ReportSemaphore::Operation::Release &&
+            report.query.report.Value() == Regs::ReportSemaphore::Report::Payload &&
+            report.query.reduction_enable == 0) {
+            if (const auto device = memory_manager.GpuToCpuAddress(report.Address())) {
+                split.NoteQueuedRelease(*device,
+                                        fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)]);
+            }
+        }
+    }
 }
 
 GPUVAddr Maxwell3D::FrontCbAddress(const FrontState& fs, u32 offset) const {

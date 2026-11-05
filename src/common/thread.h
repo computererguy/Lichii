@@ -106,6 +106,9 @@ enum class ThreadPlacement : u32 {
 };
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
+/// EDEN_NX2_HIGH_PRIORITY=1 (Windows): runs the whole process at high priority. Off by default:
+/// it only helps when other programs compete for the CPU, and slows them while playing.
+void ApplyProcessPriorityFromEnvironment();
 void SetCurrentThreadName(const char* name);
 void SetCurrentThreadToPerformanceCores();
 void SetCurrentThreadToEfficiencyCores();

@@ -729,4 +729,13 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 }
 #endif
 
+void ApplyProcessPriorityFromEnvironment() {
+#ifdef _WIN32
+    const char* const value = std::getenv("EDEN_NX2_HIGH_PRIORITY");
+    if (value != nullptr && value[0] == '1') {
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    }
+#endif
+}
+
 } // namespace Common

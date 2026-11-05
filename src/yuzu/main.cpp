@@ -11,6 +11,7 @@
 
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
+#include "common/thread.h"
 #include "startup_checks.h"
 
 #if YUZU_ROOM
@@ -163,6 +164,7 @@ static void LoadNx2Switches(const char* argv0) {
 
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+    Common::ApplyProcessPriorityFromEnvironment();
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {

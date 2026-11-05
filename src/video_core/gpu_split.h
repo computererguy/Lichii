@@ -7,9 +7,12 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <cstdlib>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <type_traits>
 
 #include "common/common_types.h"
@@ -44,6 +47,27 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
     "macro dma read cbuf",
 };
+
+/// Semaphore acquires on the split front that skip draining the back when the value is already in
+/// guest memory (these semaphores count up, so a queued release does not take a met value back).
+/// From Selevet Eglantine. EDEN_NX2_ACQUIRE_PEEK=0 always drains.
+[[nodiscard]] inline bool Nx2AcquirePeekEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_ACQUIRE_PEEK");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Acquires a release still queued for the back meets skip the drain (GpuSplit::QueuedRelease).
+/// From Selevet Eglantine. EDEN_NX2_ACQUIRE_QUEUED=0 drains instead.
+[[nodiscard]] inline bool Nx2AcquireQueuedEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_ACQUIRE_QUEUED");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && Nx2AcquirePeekEnabled();
+}
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
 // CPU's commands, parses command lists and runs the puller; engine method calls and everything
@@ -225,6 +249,30 @@ public:
         }
     }
 
+    /// Semaphore releases the front sent that the back has not run yet (front thread only). An
+    /// acquire one of them meets needs no drain: the back runs the release, then the work after
+    /// the acquire, in order, and the host queue keeps that order. Call right after sending one.
+    void NoteQueuedRelease(u64 device_address, u32 payload) {
+        queued_releases[device_address] = {payload, write_position};
+    }
+    /// The payload of the last release to `device_address` the back has not run yet.
+    [[nodiscard]] std::optional<u32> QueuedRelease(u64 device_address) {
+        if (queued_releases.empty()) {
+            return std::nullopt;
+        }
+        const auto it = queued_releases.find(device_address);
+        if (it == queued_releases.end()) {
+            return std::nullopt;
+        }
+        // Run (guest memory has it now), or sent before the split restarted.
+        if (consumed.load(std::memory_order_acquire) >= it->second.sent ||
+            it->second.sent > write_position) {
+            queued_releases.erase(it);
+            return std::nullopt;
+        }
+        return it->second.payload;
+    }
+
     /// Where the next entry goes: an entry just sent is executed once ConsumedPosition() reaches it.
     u64 WritePosition() const {
         return write_position;
@@ -334,6 +382,11 @@ private:
     std::unique_ptr<u64[]> ring;
 
     // Front side.
+    struct QueuedReleaseEntry {
+        u32 payload;
+        u64 sent; ///< Split position after the release's entry
+    };
+    std::unordered_map<u64, QueuedReleaseEntry> queued_releases;
     bool pending_flush{};
     void (*pending_flush_func)(void*){};
     void* pending_flush_argument{};
