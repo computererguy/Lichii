@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <vector>
 #include "shader_recompiler/frontend/ampere/instruction.h"
 
@@ -208,6 +210,25 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
         operand(32, input.Bits(75, 1) ? 2 : 1);
         operand(64, 2);
         break;
+    case 0xb66: {
+        // TLD, as case 0xb66 of the lowering reads it (from Orchid 71add15abd, which shadows TLD
+        // operands that alias the uniform mirrors); counting a register too many only refuses more.
+        if ((input.words[2] & ~0xffU) == 0x059e8700U) { // .F16 explicit fetch: (x, y), level, halves
+            operand(16);
+            operand(24, 2);
+            operand(32);
+            operand(64);
+            break;
+        }
+        const u32 dimension = input.Bits(61, 3);
+        const bool split = input.Bits(64, 8) != 255;
+        operand(16, split ? 2U : static_cast<u32>(std::max(1, std::popcount(input.Bits(72, 4)))));
+        operand(24, dimension == 2 || dimension == 5 || input.Bits(76, 1) ? 2 : 1);
+        operand(32, dimension == 5 && input.Bits(87, 3) == 3 ? 2 : 1);
+        if (split)
+            operand(64, 2);
+        break;
+    }
     case 0x388:
     case 0x984:
     case 0x988: {
