@@ -7,6 +7,10 @@ on:
         description: Publish the binaries as a GitHub release
         type: boolean
         default: true
+      android_only:
+        description: Build only the Android APK
+        type: boolean
+        default: false
   push:
     branches:
       - nx2-experimental
@@ -37,7 +41,7 @@ env:
 # A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
 # a later push replaces it, so the newest commit builds as soon as the running one is done.
 concurrency:
-  group: release-binaries-${{ github.ref }}
+  group: release-binaries-${{ github.ref }}${{ inputs.android_only && '-android' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -68,6 +72,7 @@ jobs:
   build:
     name: ${{ matrix.platform }} binary
     needs: prepare-release
+    if: ${{ !inputs.android_only }}
     runs-on: ${{ matrix.runner }}
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -631,7 +636,8 @@ jobs:
           set -euo pipefail
           ndk=$(sed -n 's/.*ndkVersion = "\(.*\)".*/\1/p' src/android/app/build.gradle.kts)
           echo "NDK $ndk"
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk" > /dev/null
+          # yes ends with a broken pipe once sdkmanager is done; only sdkmanager's status counts.
+          { yes || true; } | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk" > /dev/null
 
       - name: Restore Gradle and CPM downloads
         uses: actions/cache@v5
