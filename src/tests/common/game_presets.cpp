@@ -109,3 +109,36 @@ TEST_CASE("Declining the MKW preset preserves global and per-game preferences", 
         CHECK(settings->resolution_setup.UsingGlobal() == !per_game);
     }
 }
+
+TEST_CASE("OoT preset overrides saved settings for the session", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+    settings->cpu_accuracy.SetValue(Settings::CpuAccuracy::Paranoid);
+    settings->cpu_clock.SetValue(Settings::CpuClock::Boost);
+    settings->gpu_clock.SetValue(Settings::GpuClock::Overclock);
+    settings->use_asynchronous_shaders.SetValue(false);
+    settings->frame_pacing_mode.SetValue(Settings::FramePacingMode::Target_120);
+    REQUIRE(
+        Settings::ApplyOcarinaOfTimePreset(*settings, Settings::OcarinaOfTimeProgramId, true));
+    CHECK(settings->cpu_accuracy.GetValue() == Settings::CpuAccuracy::Auto);
+    CHECK(settings->cpu_clock.GetValue() == Settings::CpuClock::Normal);
+    CHECK(settings->gpu_clock.GetValue() == Settings::GpuClock::Boost);
+    CHECK(settings->use_asynchronous_shaders.GetValue());
+    CHECK(settings->frame_pacing_mode.GetValue() == Settings::FramePacingMode::Target_Auto);
+    CHECK(settings->cpu_accuracy.GetValue(true) == Settings::CpuAccuracy::Paranoid);
+    for (const auto& restore : settings->linkage.restore_functions) {
+        restore();
+    }
+    CHECK(settings->cpu_accuracy.UsingGlobal());
+    CHECK(settings->cpu_accuracy.GetValue() == Settings::CpuAccuracy::Paranoid);
+}
+
+TEST_CASE("OoT preset only applies to Ocarina of Time when accepted", "[game_presets]") {
+    auto settings = std::make_unique<Settings::Values>();
+    settings->cpu_accuracy.SetValue(Settings::CpuAccuracy::Paranoid);
+    CHECK_FALSE(Settings::ApplyOcarinaOfTimePreset(*settings, Settings::MarioKartWorldProgramId,
+                                                   true));
+    CHECK_FALSE(
+        Settings::ApplyOcarinaOfTimePreset(*settings, Settings::OcarinaOfTimeProgramId, false));
+    CHECK(settings->cpu_accuracy.UsingGlobal());
+    CHECK(settings->cpu_accuracy.GetValue() == Settings::CpuAccuracy::Paranoid);
+}

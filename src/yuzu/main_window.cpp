@@ -1989,6 +1989,24 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         Settings::UpdateGPUAccuracy();
         LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
     }
+    if (title_id == Settings::OcarinaOfTimeProgramId && !asked_recommended_oot_settings) {
+        asked_recommended_oot_settings = true;
+        use_recommended_oot_settings =
+            QMessageBox::question(
+                this, tr("Recommended Ocarina of Time settings"),
+                tr("Use the recommended settings for The Legend of Zelda: Ocarina of Time?\n\n"
+                   "Vulkan, CPU accuracy Auto, normal CPU clock, default GPU clock, asynchronous "
+                   "shaders, and automatic frame pacing.\n\n"
+                   "They apply to Ocarina of Time until Lichii is closed. Your saved settings "
+                   "are not changed."),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes) == QMessageBox::Yes;
+        LOG_INFO(Config, "OoT recommended settings accepted: {}", use_recommended_oot_settings);
+    }
+    if (Settings::ApplyOcarinaOfTimePreset(Settings::values, title_id,
+                                           use_recommended_oot_settings)) {
+        QtCommon::system->ApplySettings();
+        LOG_INFO(Config, "Applied recommended OoT settings after per-game configuration");
+    }
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {

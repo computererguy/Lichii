@@ -36,3 +36,18 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# --- The Legend of Zelda: Ocarina of Time (0400486024DEC000) ---
+# Opt-in fast paths from perf/oot-fast-draw, measured on Donkey Kong Bananza only. Enable one at a
+# time and compare FPS (EDEN_NX2_GPU_PROFILE=1 logs GPU thread time per zone). Remove any that
+# cause missing geometry, flicker or pop-in.
+# Reuse bindings of unchanged draws (1), or also keep them across constant/index buffer changes (2).
+#EDEN_NX2_FAST_DRAW=1
+# Skip repeated vertex buffer lookups and upload scans of unchanged ranges.
+#EDEN_NX2_BUFFER_SKIP=1
+# Only invalidate texture/query/shader cache pages that hold something.
+#EDEN_NX2_INLINE_INVALIDATE=1
+# Skip redundant dynamic state updates.
+#EDEN_NX2_DYNAMIC_SKIP=1
+# Record large render passes on this many threads (2-8); 4 suits a 6-core CPU.
+#EDEN_NX2_PARALLEL_RECORD=4
