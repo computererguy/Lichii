@@ -673,8 +673,8 @@ jobs:
         shell: bash
         run: |
           ninja=$(find "$ANDROID_HOME/cmake" -name ninja -type f | head -n1)
-          for dir in $(find src/android/app/.cxx -name build.ninja -printf '%h
-'); do
+          find src/android/app/.cxx -name build.ninja | while read -r file; do
+            dir=$(dirname "$file")
             echo "== $dir"
             "$ninja" -C "$dir" -k 0 2>&1 | grep -E 'error:|FAILED:|undefined (reference|symbol)' | sort -u | head -200 || true
           done
