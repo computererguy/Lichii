@@ -1,10 +1,11 @@
 # Ocarina of Time visual workaround (temporary)
 
-This is a temporary, opt-in visual workaround for The Legend of Zelda: Ocarina of Time
+This is a temporary visual workaround for The Legend of Zelda: Ocarina of Time
 (`0400486024DEC000`). It is not an emulator fix. It edits two shaders of this game so the
 outdoor haze and exposure look closer to the reference. The root cause of the haze is still open.
 
-Set `EDEN_NX2_OOT_VISUAL_WORKAROUND=1` to enable it. Any other value, or no value, leaves it off.
+It is on by default for this title (as in Orchid). Set `EDEN_NX2_OOT_VISUAL_WORKAROUND=0` to turn
+it off, for example for an A/B comparison.
 Each edited shader logs `TEMPORARY OoT visual workaround: shader <hash>, <n> scalar edits` at
 warning level. An edit count of 0 means the shader no longer has the expected shape and was left
 unchanged.
