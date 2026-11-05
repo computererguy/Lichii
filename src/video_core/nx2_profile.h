@@ -3,11 +3,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <memory>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "common/common_types.h"
 #include "video_core/gpu_split.h"
@@ -51,6 +56,7 @@ enum class Zone : u32 {
     Fence,        ///< Fences made (SignalFence)
     FenceSkipped, ///< Empty fences not made
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
+    DeferredCall, ///< Split GPU thread: work the front deferred to the back (GpuSplit::Defer)
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
     WriterWait,
@@ -66,7 +72,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "deferred call", "split drain", "split wait",
     "writer wait", "list submit wait", "list GPU wait",
 };
 
@@ -89,7 +95,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 16> counters{}; ///< See Counter
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_ns{};
     std::array<u64, static_cast<size_t>(DrainSite::Count)> drain_count{};
     u64 child_ns{};    ///< Time of the zones nested in the current one
@@ -99,9 +105,62 @@ struct ThreadData {
 
 inline thread_local ThreadData t_data;
 
+/// A finer split of a zone's exclusive time (the split's back: per engine method, per deferred
+/// call), logged every 10 s with the zones.
+struct LabelSlot {
+    u64 ns{};
+    u64 count{};
+};
+
+struct Labels {
+    static constexpr size_t MaxEngines = 8;
+    /// In the order the back first ran their methods (the engines have no RTTI to name them).
+    std::array<const void*, MaxEngines> engines{};
+    std::unique_ptr<std::array<LabelSlot, MaxEngines * 0x10000>> methods;
+    std::unordered_map<const void*, LabelSlot> calls;
+    LabelSlot sink;
+};
+
+inline thread_local Labels t_labels;
+
+/// The label of an engine's method while profiling (nullptr otherwise or past MaxEngines).
+template <typename Engine>
+inline LabelSlot* MethodLabel(const Engine* engine, u32 method) {
+    if (!Enabled()) {
+        return nullptr;
+    }
+    auto& labels = t_labels;
+    size_t index = 0;
+    for (; index < labels.engines.size(); ++index) {
+        if (labels.engines[index] == engine) {
+            break;
+        }
+        if (labels.engines[index] == nullptr) {
+            labels.engines[index] = engine;
+            break;
+        }
+    }
+    if (index == labels.engines.size()) {
+        return nullptr;
+    }
+    if (!labels.methods) {
+        labels.methods = std::make_unique<std::array<LabelSlot, Labels::MaxEngines * 0x10000>>();
+    }
+    return &(*labels.methods)[index * 0x10000 + (method & 0xffff)];
+}
+
+inline LabelSlot* CallLabel(const void* thunk) {
+    return &t_labels.calls[thunk];
+}
+
+inline LabelSlot* SinkLabel() {
+    return &t_labels.sink;
+}
+
 class Scope {
 public:
-    explicit Scope(Zone zone_) : zone{zone_}, enabled{Enabled()} {
+    explicit Scope(Zone zone_, LabelSlot* label_ = nullptr)
+        : zone{zone_}, label{label_}, enabled{Enabled()} {
         if (!enabled) {
             return;
         }
@@ -119,6 +178,10 @@ public:
         const auto index = static_cast<size_t>(zone);
         data.exclusive_ns[index] += elapsed - data.child_ns;
         ++data.count[index];
+        if (label != nullptr) {
+            label->ns += elapsed - data.child_ns;
+            ++label->count;
+        }
         data.child_ns = parent_child_ns + elapsed;
     }
 
@@ -127,6 +190,7 @@ public:
 
 private:
     Zone zone;
+    LabelSlot* label;
     bool enabled;
     u64 start{};
     u64 parent_child_ns{};
@@ -142,6 +206,7 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    SunkWrites,     ///< Split back: state writes queued in an engine's method sink
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -164,6 +229,62 @@ inline void AddDrain(DrainSite site, u64 start) {
         t_data.drain_ns[index] += Now() - start;
         ++t_data.drain_count[index];
     }
+}
+
+/// Logs the top labels of the window (exclusive ms and calls per second) and resets them.
+inline void ReportLabels(const char* thread_name, u64 window, u64 sunk_writes) {
+    auto& labels = t_labels;
+    const auto ms = [window](u64 ns) { return static_cast<double>(ns) * 1000.0 / window; };
+    const auto per_second = [window](u64 count) {
+        return static_cast<double>(count) * 1e9 / window;
+    };
+    if (labels.methods) {
+        struct Entry {
+            size_t index;
+            LabelSlot slot;
+        };
+        std::vector<Entry> entries;
+        for (size_t i = 0; i < labels.methods->size(); ++i) {
+            const LabelSlot& slot = (*labels.methods)[i];
+            if (slot.count != 0) {
+                entries.push_back({i, slot});
+            }
+        }
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.slot.ns > b.slot.ns; });
+        u64 total{};
+        for (const auto& entry : entries) {
+            total += entry.slot.ns;
+        }
+        std::string line;
+        for (size_t i = 0; i < std::min<size_t>(entries.size(), 24); ++i) {
+            const auto& entry = entries[i];
+            line += fmt::format(" | engine{} {:#x} {:.1f} ms ({:.0f}/s)", entry.index / 0x10000,
+                                entry.index % 0x10000, ms(entry.slot.ns),
+                                per_second(entry.slot.count));
+        }
+        LOG_INFO(HW_GPU,
+                 "{} method time per second: {:.1f} ms in {} methods, method sink {:.1f} ms "
+                 "({:.0f}/s), state writes sunk {:.0f}/s{}",
+                 thread_name, ms(total), entries.size(), ms(labels.sink.ns),
+                 per_second(labels.sink.count), per_second(sunk_writes), line);
+        labels.methods->fill({});
+    }
+    if (!labels.calls.empty()) {
+        std::vector<std::pair<const void*, LabelSlot>> calls(labels.calls.begin(),
+                                                             labels.calls.end());
+        std::sort(calls.begin(), calls.end(),
+                  [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+        std::string line;
+        for (size_t i = 0; i < std::min<size_t>(calls.size(), 12); ++i) {
+            line += fmt::format(" | {:.1f} ms ({:.0f}/s) {}", ms(calls[i].second.ns),
+                                per_second(calls[i].second.count),
+                                GpuSplit::ThunkName(calls[i].first));
+        }
+        LOG_INFO(HW_GPU, "{} deferred calls per second:{}", thread_name, line);
+        labels.calls.clear();
+    }
+    labels.sink = {};
 }
 
 /// Called by the GPU thread (and the split's back thread) between commands: logs and resets
@@ -234,6 +355,7 @@ inline void Report(const char* thread_name = "GPU thread") {
                             static_cast<double>(window) / 1e6);
     }
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
+    ReportLabels(thread_name, window, data.counters[static_cast<size_t>(Counter::SunkWrites)]);
     data = {};
     data.window_start = now;
     data.cpu_start_ns = cpu_now;

@@ -478,8 +478,8 @@ void BufferCacheRuntime::WaitSubmittedTick(u64 tick) {
     master.Wait(tick);
 }
 
-void BufferCacheRuntime::Finish() {
-    scheduler.Finish();
+void BufferCacheRuntime::Finish(std::source_location location) {
+    scheduler.Finish({}, {}, location);
 }
 
 bool BufferCacheRuntime::CanReorderUpload(const Buffer& buffer,

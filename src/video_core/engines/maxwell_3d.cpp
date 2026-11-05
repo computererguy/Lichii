@@ -357,6 +357,33 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
+namespace {
+
+// Methods that change nothing a draw resolves: the query cache's counters, reports and
+// conditional rendering, which the draw path handles on every draw, reused or not, and the
+// registers of the macros' memory reads (MME DMA source and data RAM index, read by the macro
+// engine only). Ocarina of Time writes them around most draws (~30,000 a second).
+bool IsFastDrawNeutralMethod(u32 method) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(render_enable.mode):
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_high):
+    case MAXWELL3D_REG_INDEX(report_semaphore.address_low):
+    case MAXWELL3D_REG_INDEX(report_semaphore.payload):
+    case MAXWELL3D_REG_INDEX(render_enable.address_high):
+    case MAXWELL3D_REG_INDEX(render_enable.address_low):
+    case 0x154: // MME DMA source address high
+    case 0x155: // MME DMA source address low
+    case 0x156: // MME DMA data RAM index
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // Anonymous namespace
+
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     // The instances after the first are drawn together once their loop ends, and they must see
     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
@@ -368,7 +395,7 @@ void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
         NoteDrawRunsWrite(method, argument);
     }
     if (VideoCommon::Nx2FastDraw::g_enabled && regs.reg_array[method] != argument &&
-        !IsFastDrawParameter(method)) [[unlikely]] {
+        !IsFastDrawParameter(method) && !IsFastDrawNeutralMethod(method)) [[unlikely]] {
         switch (method) {
         case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
         case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
@@ -441,6 +468,9 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(const_buffer.offset):
     case MAXWELL3D_REG_INDEX(global_base_vertex_index):
     case MAXWELL3D_REG_INDEX(global_base_instance_index):
+    // Nothing resolves it (the draw macros set it with the base vertex): in Ocarina of Time it
+    // changes before ~70% of draws, each of which resolved in full.
+    case MAXWELL3D_REG_INDEX(vertex_id_base):
         return true;
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method);
@@ -479,7 +509,7 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
-    if (!DrawManager::IsInstanceLoopMethod(method) &&
+    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawNeutralMethod(method) &&
         !(VideoCommon::Nx2FastDraw::g_delta_enabled && IsFastDrawDeltaMethod(method))) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
@@ -1033,6 +1063,19 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// Constant buffer uploads the back may not have run yet (FrontNoteCbWrite).
+    struct CbWrite {
+        GPUVAddr begin;
+        GPUVAddr end;
+        u64 position; ///< Split position after the upload's entry
+    };
+    std::vector<CbWrite> cb_writes;
+    /// A macro's consecutive constant buffer data writes, sent as one entry (FrontFlushCbBatch).
+    std::vector<u32> cb_batch;
+    u32 cb_batch_method{};
+    GPUVAddr cb_batch_address{};
+    u16 cb_batch_mask{};                ///< The data methods written
+    std::array<u32, 16> cb_batch_last{}; ///< Their last values
 };
 
 namespace {
@@ -1042,6 +1085,38 @@ namespace {
 bool FrontVerifyEnabled() {
     static const bool verify = std::getenv("EDEN_NX2_SPLIT_VERIFY") != nullptr;
     return verify;
+}
+
+// EDEN_NX2_DMA_CB_RANGES=0: macro memory reads wait for every constant buffer upload queued.
+bool CbRangesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_DMA_CB_RANGES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// EDEN_NX2_DMA_REPORT_RANGES=0: macro memory reads wait for every query report queued.
+bool ReportRangesEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_DMA_REPORT_RANGES");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && CbRangesEnabled();
+}
+
+// Constant buffer uploads tracked by range at once; past it they count as unranged writes.
+constexpr size_t MaxCbWrites = 1024;
+
+// EDEN_NX2_FRONT_CB_BATCH=1: send consecutive constant buffer data writes as one entry. Off by
+// default: in Ocarina of Time the runs average about two words, and each batch's register
+// fix-up left the back as many entries as before (and no faster).
+bool CbBatchEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_FRONT_CB_BATCH");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
 }
 
 // Executable methods ProcessMethodCall handles itself; the rest go to the draw manager.
@@ -1115,6 +1190,8 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     namespace Profile = VideoCommon::Nx2Profile;
     // As ProcessShadowRam does on the back.
     u32 value = argument;
+    u32 cb_offset{};
+    u32 cb_bytes{};
     bool shadow_kept = true;
     if (fs.control == Regs::ShadowRamControl::Track ||
         fs.control == Regs::ShadowRamControl::TrackWithFilter) {
@@ -1170,6 +1247,8 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             break;
         default:
             if (method >= cb_data && method < cb_data + 16) {
+                cb_offset = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+                cb_bytes = sizeof(u32);
                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
             } else if (!FrontHandledOutsideDrawManager(method)) {
                 fs.draw_pending = true;
@@ -1177,11 +1256,88 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             break;
         }
     }
+    if (cb_bytes != 0 && fs.control != Regs::ShadowRamControl::Replay && CbBatchEnabled()) {
+        if (fs.cb_batch.empty()) {
+            fs.cb_batch_method = method;
+            fs.cb_batch_address = FrontCbAddress(fs, cb_offset);
+            split.SetPendingFlush(&FrontFlushCbBatchThunk, this);
+        }
+        fs.cb_batch.push_back(argument);
+        const u32 index = method - MAXWELL3D_REG_INDEX(const_buffer.buffer);
+        fs.cb_batch_mask |= static_cast<u16>(1U << index);
+        fs.cb_batch_last[index] = argument;
+        return;
+    }
+    FrontFlushCbBatch(split, fs);
+    const u64 memory_writes = split.MemoryWritePosition();
     if (from_macro) {
         split.MacroWrite(this, method, argument);
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (cb_bytes != 0) {
+        FrontNoteCbWrite(split, fs, memory_writes, FrontCbAddress(fs, cb_offset), cb_bytes);
+    } else if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && ReportRangesEnabled()) {
+        // A query report or semaphore release writes at most 16 bytes at the report address. In
+        // Ocarina of Time one is queued before ~96% of the macro memory reads that would wait
+        // (~16,000 a second), none of them over the words read. The query cache may write the
+        // result later still (once the host GPU is done), so waiting never ensured more.
+        const GPUVAddr report =
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)]};
+        FrontNoteCbWrite(split, fs, memory_writes, report, 16);
+    }
+}
+
+GPUVAddr Maxwell3D::FrontCbAddress(const FrontState& fs, u32 offset) const {
+    return ((GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+            GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)]}) +
+           offset;
+}
+
+void Maxwell3D::FrontFlushCbBatchThunk(void* engine) {
+    auto* const maxwell3d = static_cast<Maxwell3D*>(engine);
+    if (maxwell3d->front) {
+        maxwell3d->FrontFlushCbBatch(VideoCommon::GpuSplit::Get(), *maxwell3d->front);
+    }
+}
+
+void Maxwell3D::FrontFlushCbBatch(VideoCommon::GpuSplit& split, FrontState& fs) {
+    // Command lists and macros upload constant buffers a word at a time, each word its own
+    // method (~900,000 a second in Ocarina of Time), and the back ran each entry on its own. The
+    // words go as one multi-word entry, as non-incrementing writes would, and the back's copies
+    // of the data registers (and their shadow RAM, when tracked) get the values the single
+    // writes would have left. The split sends them before anything else (SetPendingFlush).
+    if (fs.cb_batch.empty()) {
+        return;
+    }
+    const auto amount = static_cast<u32>(fs.cb_batch.size());
+    const u64 memory_writes = split.MemoryWritePosition();
+    if (amount == 1) {
+        split.MacroWrite(this, fs.cb_batch_method, fs.cb_batch[0]);
+    } else {
+        split.MultiMethod(this, fs.cb_batch_method, fs.cb_batch.data(), amount, amount, nullptr);
+    }
+    FrontNoteCbWrite(split, fs, memory_writes, fs.cb_batch_address, amount * sizeof(u32));
+    if (amount != 1) {
+        const bool track = fs.control == Regs::ShadowRamControl::Track ||
+                           fs.control == Regs::ShadowRamControl::TrackWithFilter;
+        split.Defer(
+            [this, mask = fs.cb_batch_mask, last = fs.cb_batch_last, track] {
+                constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+                for (u32 i = 0; i < 16; ++i) {
+                    if ((mask >> i) & 1) {
+                        regs.reg_array[cb_data + i] = last[i];
+                        if (track) {
+                            shadow_state.reg_array[cb_data + i] = last[i];
+                        }
+                    }
+                }
+            },
+            VideoCommon::GpuSplit::FastDrawNeutral);
+    }
+    fs.cb_batch.clear();
+    fs.cb_batch_mask = 0;
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1214,13 +1370,18 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
+    FrontFlushCbBatch(split, fs);
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
         return fs.control == Regs::ShadowRamControl::Track ||
                fs.control == Regs::ShadowRamControl::TrackWithFilter;
     };
+    u32 cb_offset{};
+    u32 cb_bytes{};
     if (method >= cb_data && method < cb_data + 16) {
+        cb_offset = fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)];
+        cb_bytes = amount * sizeof(u32);
         fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += amount * sizeof(u32);
     } else if (method == MAXWELL3D_REG_INDEX(inline_data)) {
         // Upload data only.
@@ -1286,7 +1447,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             }
         }
     }
+    const u64 memory_writes = split.MemoryWritePosition();
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
+    if (cb_bytes != 0) {
+        FrontNoteCbWrite(split, fs, memory_writes, FrontCbAddress(fs, cb_offset), cb_bytes);
+    }
 }
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
@@ -1331,6 +1496,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                       start, result.consumed, parameter_count, result.error);
         }
     }
+    FrontFlushCbBatch(split, fs);
     fs.parameters.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
@@ -1350,6 +1516,7 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     // host-level wait, so the work after the last one need not have run. EDEN_NX2_MACRO_DMA_DRAIN=1
     // waits for everything queued, as before. With EDEN_NX2_CMDPAGE_DIAG the read is repeated
     // after a full drain and the words that differ are counted.
+    FrontFlushCbBatch(split, fs);
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
@@ -1367,7 +1534,23 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (full_drain) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     } else {
-        split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead);
+        // Of the constant buffer uploads, only those over the words read (FrontNoteCbWrite).
+        u64 cb_position = 0;
+        if (!fs.cb_writes.empty()) {
+            const u64 done = split.ConsumedPosition();
+            std::erase_if(fs.cb_writes, [done](const FrontState::CbWrite& write) {
+                return write.position <= done;
+            });
+            for (const auto& write : fs.cb_writes) {
+                if (write.begin < source + read_bytes && source < write.end) {
+                    cb_position = (std::max)(cb_position, write.position);
+                }
+            }
+        }
+        if (Tegra::Nx2CmdPageDiag::g_enabled) [[unlikely]] {
+            split.DiagnoseMemoryWait(cb_position);
+        }
+        split.WaitForMemoryWriters(VideoCommon::DrainSite::MacroDmaRead, cb_position);
     }
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
@@ -1400,6 +1583,29 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
         Tegra::Nx2CmdPageDiag::RecordDmaRead(source, words, changed, gpu_written);
     }
+}
+
+void Maxwell3D::FrontNoteCbWrite(VideoCommon::GpuSplit& split, FrontState& fs, u64 memory_writes,
+                                 GPUVAddr begin, u32 bytes) {
+    // The split counts a constant buffer upload (or a report) as a memory write, which every
+    // macro memory read waits for (14,000-24,000 reads a second in Ocarina of Time, the front
+    // waiting 320-400 ms a second). Its range is known here, so FrontDmaRead waits only for the
+    // writes it overlaps.
+    if (!CbRangesEnabled()) {
+        return;
+    }
+    const GPUVAddr end = begin + bytes;
+    const u64 position = split.WritePosition();
+    if (!fs.cb_writes.empty() && fs.cb_writes.back().end == begin) {
+        fs.cb_writes.back().end = end;
+        fs.cb_writes.back().position = position;
+    } else if (fs.cb_writes.size() < MaxCbWrites) {
+        fs.cb_writes.push_back({begin, end, position});
+    } else {
+        // Too many queued: this one stays an unranged write, which the reads wait for.
+        return;
+    }
+    split.SetMemoryWritePosition(memory_writes);
 }
 
 void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {

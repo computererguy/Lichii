@@ -182,6 +182,14 @@ public:
         });
     }
 
+    /// Call 'func' for each Preflushable range (whole pages, ascending) overlapping the query
+    template <typename Func>
+    void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
+        IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
+            manager->ForEachModifiedRange(Type::Preflushable, false, manager->cpu_addr + offset, size, func);
+        });
+    }
+
 private:
     /// The tracker marks whole pages: a write next to a range on one of its pages reaches it.
     void ForgetSynchronized(VAddr cpu_addr, u64 size) noexcept {

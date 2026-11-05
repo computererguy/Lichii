@@ -210,9 +210,33 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
     if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
-        DownloadMemory(page_begin, page_end - page_begin);
+        // Downloading the page waits for the GPU (500-2,000 times a second in Ocarina of Time).
+        // A small write inside one buffer goes to that buffer instead, as CachedWriteMemory
+        // does, and the page keeps its GPU-written bytes. EDEN_NX2_WRITE_UPLOAD=0 downloads.
+        static const bool upload_writes = [] {
+            const char* const value = std::getenv("EDEN_NX2_WRITE_UPLOAD");
+            return value == nullptr || value[0] != '0';
+        }();
+        u32 buffers = 0;
+        bool covered = false;
+        if (upload_writes && size <= 64_KiB) {
+            ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+                ++buffers;
+                covered = buffer.CpuAddr() <= device_addr &&
+                          device_addr + size <= buffer.CpuAddr() + buffer.SizeBytes();
+            });
+        }
+        if (buffers == 1 && covered) {
+            tmp_buffer.resize_destructive(size);
+            device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
+            InlineMemoryImplementation(device_addr, size, tmp_buffer);
+        } else {
+            DownloadMemory(page_begin, page_end - page_begin);
+            memory_tracker.MarkRegionAsCpuModified(device_addr, size);
+        }
+    } else {
+        memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     }
-    memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     // EDEN_NX2_FAST_DRAW=2: delta draws don't bind vertex buffers again.
     if (Nx2FastDraw::g_delta_enabled && channel_state != nullptr) {
@@ -223,6 +247,37 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
                 break;
             }
         }
+    }
+}
+
+template <class P>
+void BufferCache<P>::WriteMemoryBatch(std::span<const std::pair<DAddr, std::size_t>> sequences) {
+    // Ocarina of Time hands over batches whose WriteMemory calls each waited for the GPU to
+    // download page neighbours (about 2,000 waits a second). Drop every write's own bytes first so
+    // no download lands on bytes another write in the batch changed, then download all pages at
+    // once and apply the writes.
+    boost::container::small_vector<std::pair<DAddr, u64>, 16> pages;
+    for (const auto& [device_addr, size] : sequences) {
+        if (size != 0 && IsRegionGpuModified(device_addr, size)) {
+            ClearDownload(device_addr, size);
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
+    }
+    for (const auto& [device_addr, size] : sequences) {
+        if (size == 0) {
+            continue;
+        }
+        const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
+        const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
+        if (gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+            pages.emplace_back(page_begin, page_end - page_begin);
+        }
+    }
+    if (!pages.empty()) {
+        DownloadMemoryRanges(pages);
+    }
+    for (const auto& [device_addr, size] : sequences) {
+        WriteMemory(device_addr, size, false);
     }
 }
 
@@ -289,9 +344,9 @@ std::optional<VideoCore::RasterizerDownloadArea> BufferCache<P>::GetFlushArea(DA
 }
 
 template <class P>
-void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
+void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size, std::source_location location) {
     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
-        DownloadBufferMemory(buffer, device_addr, size);
+        DownloadBufferMemory(buffer, device_addr, size, location);
     });
 }
 
@@ -434,11 +489,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         const DAddr diff = base_address - *cpu_src_address;
         const DAddr new_base_address = *cpu_dest_address + diff;
         tmp_intervals.push_back({new_base_address, size});
-        if (DownloadsAtFence(new_base_address, size)) {
-            uncommitted_gpu_modified_ranges.Add(new_base_address, size);
-        } else {
-            ArmReadTraps(new_base_address, size);
-        }
+        NoteGpuWrite(new_base_address, size);
     };
     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
     // This subtraction in this order is important for overlapping copies.
@@ -2045,11 +2096,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
-    if (DownloadsAtFence(device_addr, size)) {
-        uncommitted_gpu_modified_ranges.Add(device_addr, size);
-    } else {
-        ArmReadTraps(device_addr, size);
-    }
+    NoteGpuWrite(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
         Nx2NoteListWrite(buffer_id, device_addr, size);
@@ -2726,7 +2773,8 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
 }
 
 template <class P>
-void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
+void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size,
+                                          std::source_location location) {
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
@@ -2776,7 +2824,11 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             buffer.MarkUsage(copy.src_offset, copy.size);
         }
         runtime.CopyBuffer(download_staging.buffer, buffer, copies_span, true);
-        runtime.Finish();
+        if constexpr (requires { runtime.Finish(location); }) {
+            runtime.Finish(location);
+        } else {
+            runtime.Finish();
+        }
         for (const BufferCopy& copy : copies) {
             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
             // Undo the modified offset

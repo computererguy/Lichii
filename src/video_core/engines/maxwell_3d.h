@@ -3401,6 +3401,11 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    void FrontNoteCbWrite(VideoCommon::GpuSplit& split, FrontState& state, u64 memory_writes,
+                          GPUVAddr begin, u32 bytes);
+    GPUVAddr FrontCbAddress(const FrontState& state, u32 offset) const;
+    void FrontFlushCbBatch(VideoCommon::GpuSplit& split, FrontState& state);
+    static void FrontFlushCbBatchThunk(void* engine);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

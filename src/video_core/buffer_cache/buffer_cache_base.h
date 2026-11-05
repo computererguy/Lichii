@@ -7,6 +7,7 @@
 #pragma once
 
 #include <algorithm>
+#include <source_location>
 #include <cstdlib>
 #include <array>
 #include <bit>
@@ -247,11 +248,15 @@ public:
     /// when the memory is going away).
     void WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data = true);
 
+    /// WriteMemory for a batch of CPU writes, downloading the GPU-written bytes sharing their
+    /// pages with one GPU wait instead of one per range.
+    void WriteMemoryBatch(std::span<const std::pair<DAddr, std::size_t>> sequences);
+
     void CachedWriteMemory(DAddr device_addr, u64 size);
 
     bool OnCPUWrite(DAddr device_addr, u64 size);
 
-    void DownloadMemory(DAddr device_addr, u64 size);
+    void DownloadMemory(DAddr device_addr, u64 size, std::source_location location = std::source_location::current());
 
     /// DownloadMemory for each range, waiting for the GPU once.
     void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
@@ -580,7 +585,8 @@ private:
 
     void DownloadBufferMemory(Buffer& buffer_id);
 
-    void DownloadBufferMemory(Buffer& buffer_id, DAddr device_addr, u64 size);
+    void DownloadBufferMemory(Buffer& buffer_id, DAddr device_addr, u64 size,
+                              std::source_location location = std::source_location::current());
 
     /// Downloads the GPU-written data of several buffers with one wait for the GPU.
     void DownloadBuffersMemory(std::span<const BufferId> buffer_ids);
@@ -680,15 +686,47 @@ private:
         return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
     }
 
-    /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
-    /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
-    /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
-    bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
-        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
+    /// Queues a GPU write for copy-back at the next fence. Pages the guest CPU has read
+    /// (Preflushable, set by the first reactive flush) always are: later reads skip the flush and
+    /// rely on these downloads, e.g. collision meshes skinned by compute shaders. Only those
+    /// pages of the write are (the whole write copied back ~11 GiB/s in Ocarina of Time, ~0.8
+    /// GiB/s this way) and its other pages get read traps. EDEN_NX2_PREFLUSH_PAGES=0 downloads
+    /// the whole write.
+    void NoteGpuWrite(DAddr device_addr, u64 size) {
+        static const bool page_downloads = [] {
+            const char* const value = std::getenv("EDEN_NX2_PREFLUSH_PAGES");
+            return value == nullptr || *value != '0';
+        }();
+        if (AsyncBufferDownloads() ||
+            (!page_downloads && memory_tracker.IsRegionPreflushable(device_addr, size))) {
+            uncommitted_gpu_modified_ranges.Add(device_addr, size);
+            return;
+        }
+        if (!page_downloads) {
+            ArmReadTraps(device_addr, size);
+            return;
+        }
+        const DAddr end = device_addr + size;
+        DAddr trap_begin = device_addr;
+        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr begin, u64 length) {
+            const DAddr lower = (std::max)(begin, device_addr);
+            const DAddr upper = (std::min)(begin + length, end);
+            if (lower >= upper) {
+                return;
+            }
+            if (trap_begin < lower) {
+                ArmReadTraps(trap_begin, lower - trap_begin);
+            }
+            uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
+            trap_begin = upper;
+        });
+        if (trap_begin < end) {
+            ArmReadTraps(trap_begin, end - trap_begin);
+        }
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
-    /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+    /// pages, which flushes them once and marks them Preflushable (then NoteGpuWrite downloads them).
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);

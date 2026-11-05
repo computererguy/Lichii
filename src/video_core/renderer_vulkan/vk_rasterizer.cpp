@@ -1940,9 +1940,7 @@ void RasterizerVulkan::InnerInvalidation(std::span<const std::pair<DAddr, std::s
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
-            buffer_cache.WriteMemory(addr, size);
-        }
+        buffer_cache.WriteMemoryBatch(sequences);
     }
     for (const auto& [addr, size] : sequences) {
         query_cache.InvalidateRegion(addr, size);
@@ -1988,9 +1986,7 @@ void RasterizerVulkan::FilteredInvalidation(
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
-            buffer_cache.WriteMemory(addr, size);
-        }
+        buffer_cache.WriteMemoryBatch(sequences);
     }
     const auto query_serial = [this](DAddr addr, size_t size) {
         return query_cache.CleanSerial(addr, size);

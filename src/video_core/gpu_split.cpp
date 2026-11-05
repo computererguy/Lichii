@@ -15,7 +15,12 @@
 #include <windows.h>
 #endif
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
+#include <vector>
+#include <string_view>
+#include <unordered_map>
 
 #include "common/dkb_cpu_trace.h"
 #include "common/logging.h"
@@ -186,6 +191,7 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    FlushPending();
     if (published_local == write_position) {
         return;
     }
@@ -199,6 +205,7 @@ void GpuSplit::Publish() {
 }
 
 void GpuSplit::Drain(DrainSite site) {
+    FlushPending();
     consumed_cache = consumed.load(std::memory_order_acquire);
     if (consumed_cache == write_position) {
         return;
@@ -222,16 +229,22 @@ void GpuSplit::Drain(DrainSite site) {
 }
 
 bool GpuSplit::WaitForWriters() {
+    FlushPending();
     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
 }
 
 bool GpuSplit::WaitForSync() {
+    FlushPending();
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
 }
 
-bool GpuSplit::WaitForMemoryWriters(DrainSite site) {
+bool GpuSplit::WaitForMemoryWriters(DrainSite site, u64 position, DrainSite position_site) {
+    FlushPending();
     const u64 target =
         std::max({last_writer_position, last_sync_position, last_memory_write_position});
+    if (position > target) {
+        return WaitFor(std::min(position, write_position), position_site);
+    }
     return WaitFor(std::min(target, write_position), site);
 }
 
@@ -269,6 +282,7 @@ void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
 
 void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                            u32 amount, u32 methods_pending, const GPUVAddr* segment) {
+    FlushPending();
     SelectEngine(engine);
     // Long runs (constant buffer and inline uploads) go in pieces, as when a method's data
     // continues in the next GPFIFO entry.
@@ -291,8 +305,66 @@ void GpuSplit::MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, 
         methods_pending -= piece;
     }
     if (engine->memory_write_mask[method]) {
-        last_memory_write_position = write_position;
+        NoteMemoryWriter(engine, method);
     }
+}
+
+void GpuSplit::DiagnoseMemoryWait(u64 position) {
+    static u64 reads{};
+    static u64 waits{};
+    static std::array<u64, 4> binding{}; // writer, sync, memory, constant buffer
+    static std::map<std::pair<const void*, u32>, u64> memory_methods;
+    static std::vector<const void*> engines;
+    const u64 done = consumed.load(std::memory_order_acquire);
+    const u64 writer = std::min(last_writer_position, write_position);
+    const u64 sync = std::min(last_sync_position, write_position);
+    const u64 memory = std::min(last_memory_write_position, write_position);
+    const u64 cb = std::min(position, write_position);
+    const u64 target = std::max({writer, sync, memory, cb});
+    ++reads;
+    if (target > done) {
+        ++waits;
+        if (target == cb) {
+            ++binding[3];
+        } else if (target == memory) {
+            ++binding[2];
+            ++memory_methods[{last_memory_writer.engine, last_memory_writer.method}];
+        } else if (target == sync) {
+            ++binding[1];
+        } else {
+            ++binding[0];
+        }
+    }
+    if (reads % 20000 != 0) {
+        return;
+    }
+    std::vector<std::pair<u64, std::pair<const void*, u32>>> sorted;
+    for (const auto& [key, count] : memory_methods) {
+        sorted.push_back({count, key});
+    }
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::string methods;
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 10); ++i) {
+        const auto [engine, method] = sorted[i].second;
+        if (engine == nullptr) {
+            methods += fmt::format(" deferred {}", sorted[i].first);
+            continue;
+        }
+        auto it = std::find(engines.begin(), engines.end(), engine);
+        if (it == engines.end()) {
+            engines.push_back(engine);
+            it = engines.end() - 1;
+        }
+        methods += fmt::format(" engine{} {:#x} {}", it - engines.begin(), method, sorted[i].first);
+    }
+    LOG_INFO(HW_GPU,
+             "macro DMA read waits: {} of {} reads had queued work to wait for; the latest was "
+             "compute/copy {}, host sync {}, memory write {}, constant buffer upload {} | memory "
+             "writes by method:{}",
+             waits, reads, binding[0], binding[1], binding[2], binding[3], methods);
+    reads = waits = 0;
+    binding = {};
+    memory_methods.clear();
 }
 
 void GpuSplit::DeferFunction(std::function<void()>&& func) {
@@ -301,6 +373,55 @@ void GpuSplit::DeferFunction(std::function<void()>&& func) {
         (*heap)();
         delete heap;
     });
+}
+
+const bool GpuSplit::name_thunks = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+
+namespace {
+std::mutex g_thunk_names_mutex;
+std::unordered_map<const void*, const char*> g_thunk_names;
+} // Anonymous namespace
+
+void GpuSplit::NameThunk(const void* thunk, const char* signature) {
+    std::scoped_lock lock{g_thunk_names_mutex};
+    g_thunk_names.emplace(thunk, signature);
+}
+
+std::string GpuSplit::ThunkName(const void* thunk) {
+    std::string name;
+    {
+        std::scoped_lock lock{g_thunk_names_mutex};
+        const auto it = g_thunk_names.find(thunk);
+        if (it == g_thunk_names.end()) {
+            return fmt::format("{}", thunk);
+        }
+        name = it->second;
+    }
+    // "... ThunkSignature<FUNC>(void)": keep FUNC, the lambda and the function it is in.
+    const size_t begin = name.find("ThunkSignature<");
+    const size_t end = name.rfind(">(");
+    if (begin != std::string::npos && end != std::string::npos && end > begin) {
+        name = name.substr(begin + 15, end - begin - 15);
+    }
+    for (const std::string_view noise : {"class ", "struct ", "__cdecl ", "Tegra::Engines::",
+                                         "VideoCommon::", "Vulkan::"}) {
+        for (size_t at = name.find(noise); at != std::string::npos; at = name.find(noise)) {
+            name.erase(at, noise.size());
+        }
+    }
+    if (name.size() > 200) {
+        name.resize(200);
+    }
+    return name;
+}
+
+void GpuSplit::ConsumeSink(Tegra::Engines::EngineInterface* engine) {
+    if (Nx2Profile::Enabled() && !engine->method_sink.empty()) [[unlikely]] {
+        Nx2Profile::Scope sink_scope{Nx2Profile::Zone::Method, Nx2Profile::SinkLabel()};
+        engine->ConsumeSink(*system);
+        return;
+    }
+    engine->ConsumeSink(*system);
 }
 
 size_t GpuSplit::Execute(const u64* entry) {
@@ -319,14 +440,19 @@ size_t GpuSplit::Execute(const u64* entry) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
         }
         if ((head & Direct) != 0) {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            engine->ConsumeSink(*system);
+            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method,
+                                           Nx2Profile::MethodLabel(engine, method)};
+            ConsumeSink(engine);
             engine->CallMethod(*system, method, argument, true);
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
+            if (Nx2Profile::Enabled()) {
+                Nx2Profile::Add(Nx2Profile::Counter::SunkWrites, 1);
+            }
         } else {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-            engine->ConsumeSink(*system);
+            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method,
+                                           Nx2Profile::MethodLabel(engine, method)};
+            ConsumeSink(engine);
             if ((head & HasSegment) != 0) {
                 engine->current_dma_segment = entry[1];
             }
@@ -342,8 +468,9 @@ size_t GpuSplit::Execute(const u64* entry) {
         if (!engine->reports_fast_draw_breaks) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::OtherEngine);
         }
-        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
-        engine->ConsumeSink(*system);
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method,
+                                       Nx2Profile::MethodLabel(engine, method)};
+        ConsumeSink(engine);
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
         }
@@ -356,6 +483,10 @@ size_t GpuSplit::Execute(const u64* entry) {
             Nx2FastDraw::Break(Nx2FastDraw::Reason::Call);
         }
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
+        Nx2Profile::Scope call_scope{
+            Nx2Profile::Zone::DeferredCall,
+            Nx2Profile::Enabled() ? Nx2Profile::CallLabel(reinterpret_cast<const void*>(entry[1]))
+                                  : nullptr};
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
     }

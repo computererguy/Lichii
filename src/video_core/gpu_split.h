@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
 #include <thread>
 #include <type_traits>
 
@@ -33,6 +34,7 @@ enum class DrainSite : u32 {
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
     MacroDmaCheck,  ///< EDEN_NX2_CMDPAGE_DIAG: a macro's memory read repeated after a full drain
+    MacroDmaReadCb, ///< MacroDmaRead, for a constant buffer upload over the words read
     Count,
 };
 
@@ -40,6 +42,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> 
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
     "gp sync fence", "map",           "front start", "front verify",  "macro dma check",
+    "macro dma read cbuf",
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -95,6 +98,7 @@ public:
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
                 const GPUVAddr* segment) {
+        FlushPending();
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
@@ -106,20 +110,21 @@ public:
         }
         Commit(words);
         if (engine->memory_write_mask[method]) {
-            last_memory_write_position = write_position;
+            NoteMemoryWriter(engine, method);
         }
     }
     void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
                      u32 amount, u32 methods_pending, const GPUVAddr* segment);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        FlushPending();
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
         if (engine->memory_write_mask[method]) {
-            last_memory_write_position = write_position;
+            NoteMemoryWriter(engine, method);
         }
     }
 
@@ -131,6 +136,13 @@ public:
     template <typename Func>
     void Defer(const Func& func, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        if (name_thunks) [[unlikely]] {
+            static const bool named = (NameThunk(reinterpret_cast<const void*>(&CallThunk<Func>),
+                                                 ThunkSignature<Func>()),
+                                       true);
+            (void)named;
+        }
+        FlushPending();
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
         entry[0] = static_cast<u64>(Kind::Call) | flags | (u64{payload} << 8);
@@ -157,6 +169,9 @@ public:
     static inline bool check_owner{};
     static void CheckOwner(const char* where);
 
+    /// What a deferred call's thunk runs (from its signature), for the back's profile.
+    static std::string ThunkName(const void* thunk);
+
     /// Makes what was sent visible to the back.
     void Publish();
     /// Waits until the back executed everything sent so far.
@@ -164,6 +179,7 @@ public:
 
     /// Compute or copy work was just sent: what can write GPU-written command lists.
     void NoteWriter() {
+        FlushPending();
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
@@ -173,6 +189,7 @@ public:
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
     void NoteSync() {
+        FlushPending();
         last_sync_position = write_position;
     }
     /// Waits until the back executed the work sent before the last NoteSync. Returns whether any
@@ -180,12 +197,58 @@ public:
     bool WaitForSync();
     /// Deferred work that can write memory was just sent (puller semaphore releases, maps).
     void NoteMemoryWrite() {
-        last_memory_write_position = write_position;
+        FlushPending();
+        NoteMemoryWriter(nullptr, 0xffff);
     }
     /// For the front's macro memory reads (MME DMA): waits until the back executed the methods
     /// that write memory in command order (memory_write_mask, NoteMemoryWrite), the compute and
     /// copy work and the work before the last host-level wait, all sent so far.
-    bool WaitForMemoryWriters(DrainSite site);
+    /// `position`: also an entry the engine tracks itself (written memory it knows the range of),
+    /// waited for under `position_site` when it is the later one.
+    bool WaitForMemoryWriters(DrainSite site, u64 position = 0,
+                              DrainSite position_site = DrainSite::MacroDmaReadCb);
+
+    /// Writes an engine holds back to send as one entry (Maxwell3D::FrontFlushCbBatch): `flush`
+    /// sends them before anything else enters the ring and before the front waits or publishes.
+    void SetPendingFlush(void (*flush)(void*), void* argument) {
+        if (pending_flush && pending_flush_argument != argument) {
+            FlushPending();
+        }
+        pending_flush_func = flush;
+        pending_flush_argument = argument;
+        pending_flush = true;
+    }
+    void FlushPending() {
+        if (pending_flush) [[unlikely]] {
+            pending_flush = false;
+            pending_flush_func(pending_flush_argument);
+        }
+    }
+
+    /// Where the next entry goes: an entry just sent is executed once ConsumedPosition() reaches it.
+    u64 WritePosition() const {
+        return write_position;
+    }
+    /// How far the back has executed (acquire: its memory writes before it are visible).
+    u64 ConsumedPosition() const {
+        return consumed.load(std::memory_order_acquire);
+    }
+    /// What WaitForMemoryWriters waits for of the methods in memory_write_mask: an engine that
+    /// tracks a write's range itself puts back the value from before sending it.
+    u64 MemoryWritePosition() const {
+        return last_memory_write_position;
+    }
+    void SetMemoryWritePosition(u64 position) {
+        if (position == previous_memory_writer.position) {
+            last_memory_writer = previous_memory_writer;
+        }
+        last_memory_write_position = position;
+    }
+
+    /// EDEN_NX2_CMDPAGE_DIAG: for a macro memory read about to wait (FrontDmaRead), counts which
+    /// queued work it waits for (compute and copies, a host sync, which memory-writing method, a
+    /// constant buffer upload over its words) and logs the counts every 20,000 reads.
+    void DiagnoseMemoryWait(u64 position);
 
 private:
     enum class Kind : u64 {
@@ -208,6 +271,20 @@ private:
     static void CallThunk(const u64* payload) {
         (*reinterpret_cast<const Func*>(payload))();
     }
+
+    /// EDEN_NX2_GPU_PROFILE: deferred calls are named in the back's profile by what they run.
+    static const bool name_thunks;
+    static void NameThunk(const void* thunk, const char* signature);
+    template <typename Func>
+    static const char* ThunkSignature() {
+#ifdef _MSC_VER
+        return __FUNCSIG__;
+#else
+        return __PRETTY_FUNCTION__;
+#endif
+    }
+    /// The engine's queued state writes, timed apart from the method that flushes them.
+    void ConsumeSink(Tegra::Engines::EngineInterface* engine);
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
@@ -234,6 +311,20 @@ private:
     void SwitchEngine(Tegra::Engines::EngineInterface* engine);
     bool WaitFor(u64 target, DrainSite site);
 
+    struct MemoryWriter {
+        u64 position{};
+        const void* engine{}; ///< nullptr: deferred work (NoteMemoryWrite)
+        u32 method{};
+    };
+    void NoteMemoryWriter(const void* engine, u32 method) {
+        previous_memory_writer = last_memory_writer;
+        previous_memory_writer.position = last_memory_write_position;
+        last_memory_write_position = write_position;
+        last_memory_writer = {write_position, engine, method};
+    }
+    MemoryWriter last_memory_writer{};
+    MemoryWriter previous_memory_writer{};
+
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
 
@@ -243,6 +334,9 @@ private:
     std::unique_ptr<u64[]> ring;
 
     // Front side.
+    bool pending_flush{};
+    void (*pending_flush_func)(void*){};
+    void* pending_flush_argument{};
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
