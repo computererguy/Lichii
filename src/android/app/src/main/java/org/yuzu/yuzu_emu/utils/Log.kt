@@ -23,6 +23,9 @@ object Log {
 
     external fun critical(message: String)
 
+    /** Writes out what the log file still buffers. */
+    external fun flush()
+
     fun logDeviceInfo() {
         info("Device Manufacturer - ${Build.MANUFACTURER}")
         info("Device Model - ${Build.MODEL}")

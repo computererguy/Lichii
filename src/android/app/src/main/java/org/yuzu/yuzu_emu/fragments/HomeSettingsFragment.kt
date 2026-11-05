@@ -7,6 +7,7 @@ import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.view.LayoutInflater
@@ -483,14 +484,28 @@ class HomeSettingsFragment : Fragment() {
             )
         )!!
 
-        val intent = Intent(Intent.ACTION_SEND)
-            .setDataAndType(currentLog.uri, FileUtil.TEXT_PLAIN)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        // This session's log, written out first (it is buffered), and before a game ran in this
+        // session also the last one's, which may hold a crash. Only the last one's was shared
+        // until a game launched, so what the game folder scan logged never was.
+        Log.flush()
+        val logs = arrayListOf<Uri>()
+        if (currentLog.exists()) {
+            logs.add(currentLog.uri)
+        }
         if (!Log.gameLaunched && oldLog.exists()) {
-            intent.putExtra(Intent.EXTRA_STREAM, oldLog.uri)
-            startActivity(Intent.createChooser(intent, getText(R.string.share_log)))
-        } else if (currentLog.exists()) {
-            intent.putExtra(Intent.EXTRA_STREAM, currentLog.uri)
+            logs.add(oldLog.uri)
+        }
+        if (logs.isNotEmpty()) {
+            val intent = if (logs.size == 1) {
+                Intent(Intent.ACTION_SEND)
+                    .setDataAndType(logs[0], FileUtil.TEXT_PLAIN)
+                    .putExtra(Intent.EXTRA_STREAM, logs[0])
+            } else {
+                Intent(Intent.ACTION_SEND_MULTIPLE)
+                    .setType(FileUtil.TEXT_PLAIN)
+                    .putParcelableArrayListExtra(Intent.EXTRA_STREAM, logs)
+            }
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             startActivity(Intent.createChooser(intent, getText(R.string.share_log)))
         } else {
             Toast.makeText(

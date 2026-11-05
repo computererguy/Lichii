@@ -59,6 +59,10 @@ object GameHelper {
         gameDirs.forEachIndexed { index: Int, gameDir: GameDir ->
             val gameDirUri = gameDir.uriString.toUri()
             val isValid = FileUtil.isTreeUriValid(gameDirUri)
+            Log.info(
+                "Game scan: folder ${gameDir.uriString} deep scan ${gameDir.deepScan}" +
+                    if (isValid) "" else " (no access: removed)"
+            )
             if (isValid) {
                 val scanDepth = if (gameDir.deepScan) 3 else 1
 
@@ -83,6 +87,7 @@ object GameHelper {
             }
         }
         NativeConfig.setGameDirs(gameDirs.toTypedArray())
+        Log.info("Game scan: ${games.size} games in ${gameDirs.size} folders")
 
         // Cache list of games found on disk
         val serializedGames = mutableSetOf<String>()
@@ -148,6 +153,9 @@ object GameHelper {
         }
 
         files.forEach {
+            if (it.isDirectory && depth == 1) {
+                Log.info("Game scan: not looking inside ${it.filename} (turn on deep scan)")
+            }
             if (it.isDirectory) {
                 addGamesRecursive(
                     games,
@@ -168,6 +176,10 @@ object GameHelper {
 
                 if (Game.extensions.contains(extension)) {
                     val game = getGame(it.uri, true, false)
+                    Log.info(
+                        "Game scan: ${it.filename} " +
+                            if (game != null) "added (${game.title})" else "rejected"
+                    )
                     if (game != null) {
                         games.add(game)
                         if (game.programId != "0") {

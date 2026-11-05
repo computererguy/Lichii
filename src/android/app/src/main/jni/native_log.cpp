@@ -30,4 +30,10 @@ void Java_org_yuzu_yuzu_1emu_utils_Log_critical(JNIEnv* env, jobject obj, jstrin
     LOG_CRITICAL(Frontend, "{}", Common::Android::GetJString(env, jmessage));
 }
 
+// The log file is written in 4 KiB blocks (and at once only for errors): write out what is
+// buffered, e.g. before the log is shared. Common::Log::Stop only flushes the backends.
+void Java_org_yuzu_yuzu_1emu_utils_Log_flush(JNIEnv* env, jobject obj) {
+    Common::Log::Stop();
+}
+
 } // extern "C"
