@@ -97,6 +97,7 @@ public:
         u32 stage;
         u32 tic;
         VideoCommon::ImageViewId id;
+        VideoCommon::SamplerId sampler;
     };
 
     /// The sampled textures of the last configured draw, kept for EDEN_NX2_FRAME_DUMP_SAMPLED.
@@ -110,6 +111,10 @@ public:
 
     bool SupportsAlphaToOne() const noexcept {
         return fragment_has_color0_output;
+    }
+
+    bool FragmentCanDiscard() const noexcept {
+        return stage_infos[NUM_STAGES - 1].uses_demote_to_helper_invocation;
     }
 
     bool UsesExtendedDynamicState() const noexcept {
