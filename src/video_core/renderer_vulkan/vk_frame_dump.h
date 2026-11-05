@@ -242,6 +242,9 @@ private:
     std::vector<std::pair<GPUVAddr, u32>> pass_sampled;
     /// (compute shader hash, image address, format/level/layer) already read back this frame.
     std::vector<std::tuple<u64, GPUVAddr, u32>> dispatch_sampled;
+    /// (address, format, level, layer) of block-compressed textures already read back; the GPU
+    /// never writes them, so one copy per frame suffices.
+    std::vector<std::tuple<GPUVAddr, u32, s32, s32>> recorded_blocks;
     /// (shader hash, storage, binding index, device address, size) already recorded this frame.
     std::vector<std::tuple<u64, bool, u32, u64, u32>> seen_buffers;
     /// Content hashes of the buffer files written; writer thread only.

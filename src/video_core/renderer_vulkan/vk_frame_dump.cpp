@@ -411,6 +411,18 @@ bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string nam
                               std::string tags) {
     tags += SamplerJson(texture.sampler);
     if (const auto target = MakeTarget(*texture.view, index)) {
+        if (VideoCore::Surface::DefaultBlockWidth(target->format) != 1) {
+            const std::tuple key{target->gpu_addr, static_cast<u32>(target->format), target->level,
+                                 target->layer};
+            if (std::ranges::find(recorded_blocks, key) != recorded_blocks.end()) {
+                Enqueue({.tags = fmt::format(
+                             R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"gpu_addr":"{:#x}","skipped":"recorded"}})",
+                             name, tags, target->format, target->width, target->height,
+                             target->gpu_addr)});
+                return false;
+            }
+            recorded_blocks.push_back(key);
+        }
         return Record(*target, std::move(name), std::move(tags));
     }
     const Image& image = *texture.view->BackingImage();
