@@ -71,20 +71,35 @@ static RomMetadata GetRomMetadata(const std::string& path, bool reload = false) 
 extern "C" {
 
 jboolean Java_org_yuzu_yuzu_1emu_utils_GameMetadata_getIsValid(JNIEnv* env, jobject obj, jstring jpath) {
-    if (auto const file = EmulationSession::GetInstance().System().GetFilesystem()->OpenFile(Common::Android::GetJString(env, jpath), FileSys::OpenMode::Read); file) {
+    // The reasons go to the log: the game folder scan shows nothing for a rejected file.
+    const auto path = Common::Android::GetJString(env, jpath);
+    if (auto const file = EmulationSession::GetInstance().System().GetFilesystem()->OpenFile(path, FileSys::OpenMode::Read); file) {
         if (auto loader = Loader::GetLoader(EmulationSession::GetInstance().System(), file); loader) {
             auto const file_type = loader->GetFileType();
-            if (file_type == Loader::FileType::Unknown || file_type == Loader::FileType::Error)
+            if (file_type == Loader::FileType::Unknown || file_type == Loader::FileType::Error) {
+                LOG_WARNING(Loader, "Not a game (type {}): {}", Loader::GetFileTypeString(file_type), path);
                 return false;
+            }
             if ((file_type == Loader::FileType::NSP || file_type == Loader::FileType::XCI ||
                  file_type == Loader::FileType::NSZ || file_type == Loader::FileType::XCZ ||
                  file_type == Loader::FileType::NUP) &&
-                !Loader::IsBootableGameContainer(file, file_type))
+                !Loader::IsBootableGameContainer(file, file_type)) {
+                LOG_WARNING(Loader, "No bootable program in {}: {}", Loader::GetFileTypeString(file_type), path);
                 return false;
+            }
             u64 program_id = 0;
-            return loader->ReadProgramId(program_id) == Loader::ResultStatus::Success;
+            const auto result = loader->ReadProgramId(program_id);
+            if (result != Loader::ResultStatus::Success) {
+                LOG_WARNING(Loader, "No program id in {} ({}): {}", Loader::GetFileTypeString(file_type),
+                            Loader::GetResultStatusString(result), path);
+                return false;
+            }
+            return true;
         }
+        LOG_WARNING(Loader, "No loader for {}", path);
+        return false;
     }
+    LOG_WARNING(Loader, "Could not open {}", path);
     return false;
 }
 
