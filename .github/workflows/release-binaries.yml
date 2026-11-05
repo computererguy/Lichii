@@ -79,7 +79,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # oot-optimized fork: Windows builds only.
+          # oot-optimized fork: Windows and Linux (no PGO or macOS builds), Android below.
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
           - platform: windows-x86_64
             runner: windows-2022
           - platform: windows-x86_64-pgo
@@ -603,12 +607,71 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  # The Android app (src/android), mainline flavor, arm64. Without ANDROID_KEYSTORE_FILE the
+  # release build is signed with the repo's debug key, so the APK installs as it is.
+  android:
+    name: android-arm64 APK
+    needs: prepare-release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk=$(sed -n 's/.*ndkVersion = "\(.*\)".*/\1/p' src/android/app/build.gradle.kts)
+          echo "NDK $ndk"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$ndk" > /dev/null
+
+      - name: Restore Gradle and CPM downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .cache/cpm
+          key: android-v1-${{ hashFiles('src/android/**/*.kts', 'cpmfile.json', 'CMakeModules/CPM*.cmake') }}
+          restore-keys: |
+            android-v1-
+
+      - name: Build APK
+        shell: bash
+        working-directory: src/android
+        env:
+          CPM_SOURCE_CACHE: ${{ github.workspace }}/.cache/cpm
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleMainlineRelease
+          apk=$(find app/build/outputs/apk/mainline/release -name '*.apk' | head -n1)
+          cp "$apk" "${GITHUB_WORKSPACE}/lichii-${GITHUB_SHA}-android-arm64.apk"
+          ls -la "${GITHUB_WORKSPACE}/lichii-${GITHUB_SHA}-android-arm64.apk"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-android-arm64-${{ github.sha }}
+          path: lichii-${{ github.sha }}-android-arm64.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
   # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
   # unticked.
   release:
     name: Publish release
-    needs: build
+    needs: [build, android]
     if: github.event_name == 'push' || inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
@@ -633,6 +696,10 @@ jobs:
             if compgen -G "$artifact*.AppImage" > /dev/null; then
               # Linux: ship the AppImage and the tar.gz as they are.
               for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
+                cp "$file" "dist/$(strip_sha "$(basename "$file")")"
+              done
+            elif compgen -G "$artifact*.apk" > /dev/null; then
+              for file in "$artifact"*.apk; do
                 cp "$file" "dist/$(strip_sha "$(basename "$file")")"
               done
             elif compgen -G "$artifact*.zip" > /dev/null; then
@@ -679,6 +746,12 @@ jobs:
           | --- | --- | --- | --- |
           | amd64 / x86_64 (MSVC) | [MSVC zip](${base}/lichii-windows-x86_64.zip) | | Use if you run into graphical issues on other builds |
           | amd64 / x86_64 (MinGW) | | [PGO zip](${base}/lichii-windows-x86_64-pgo.zip) | Built with MinGW clang; bundles its own DLLs, no Visual C++ redistributable needed |
+
+          ## Android
+
+          | Build Type | Standard | Notes |
+          | --- | --- | --- |
+          | arm64 | [APK](${base}/lichii-android-arm64.apk) | Signed with the debug key: allow installs from unknown sources |
 
           ## macOS
 
