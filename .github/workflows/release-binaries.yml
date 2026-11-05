@@ -666,6 +666,19 @@ jobs:
           cp "$apk" "${GITHUB_WORKSPACE}/lichii-${GITHUB_SHA}-android-arm64.apk"
           ls -la "${GITHUB_WORKSPACE}/lichii-${GITHUB_SHA}-android-arm64.apk"
 
+      # Gradle stops at the first compile error: on failure, build the rest with ninja -k 0 and
+      # list every error at once.
+      - name: List all compile errors
+        if: failure()
+        shell: bash
+        run: |
+          ninja=$(find "$ANDROID_HOME/cmake" -name ninja -type f | head -n1)
+          for dir in $(find src/android/app/.cxx -name build.ninja -printf '%h
+'); do
+            echo "== $dir"
+            "$ninja" -C "$dir" -k 0 2>&1 | grep -E 'error:|FAILED:|undefined (reference|symbol)' | sort -u | head -200 || true
+          done
+
       - name: Upload APK
         uses: actions/upload-artifact@v7
         with:
