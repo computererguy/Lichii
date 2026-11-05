@@ -634,6 +634,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # The host shaders are compiled to SPIR-V on the build machine.
+          sudo apt-get update > /dev/null
+          sudo apt-get install -y --no-install-recommends glslang-tools > /dev/null
           ndk=$(sed -n 's/.*ndkVersion = "\(.*\)".*/\1/p' src/android/app/build.gradle.kts)
           echo "NDK $ndk"
           # yes ends with a broken pipe once sdkmanager is done; only sdkmanager's status counts.
