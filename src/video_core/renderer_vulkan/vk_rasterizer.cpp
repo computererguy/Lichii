@@ -1904,6 +1904,16 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
     return new_area;
 }
 
+// Before a GPU engine's write lands in guest memory: cancel the range's pending downloads, so a
+// fence popping one between the copy and InvalidateRegion can't write older GPU bytes over it.
+void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (addr == 0 || size == 0 || False(which & VideoCommon::CacheType::BufferCache)) {
+        return;
+    }
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.ClearDownload(addr, size);
+}
+
 void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (addr == 0 || size == 0) {
         return;
