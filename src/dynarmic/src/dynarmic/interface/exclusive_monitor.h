@@ -17,6 +17,12 @@
 
 #include <dynarmic/common/spin_lock.h>
 
+// Lock-free reservations on arm64 where the standard library has std::atomic_ref (not
+// Android's NDK libc++); elsewhere the spin lock as before.
+#if defined(ARCHITECTURE_arm64) && defined(__cpp_lib_atomic_ref)
+#define DYNARMIC_ATOMIC_EXCLUSIVE_MONITOR 1
+#endif
+
 namespace Dynarmic {
 
 using VAddr = std::uint64_t;
@@ -38,7 +44,7 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         const VAddr masked_address = address & RESERVATION_GRANULE_MASK;
 
-#ifdef ARCHITECTURE_arm64
+#ifdef DYNARMIC_ATOMIC_EXCLUSIVE_MONITOR
         std::atomic_ref<VAddr>{exclusive_addresses[processor_id]}.store(masked_address, std::memory_order_release);
         const T value = op();
         std::memcpy(exclusive_values[processor_id].data(), &value, sizeof(T));
