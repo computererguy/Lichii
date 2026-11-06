@@ -24,3 +24,10 @@ TEST_CASE("Legacy pending draws retain the async heuristic", "[video_core][async
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 100, 6));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 0, 0));
 }
+
+TEST_CASE("Native pending draws skipped on request follow the async heuristic", "[video_core][async_draw]") {
+    REQUIRE(Vulkan::CanDiscardPendingDraw(true, true, 0, 0, true));
+    REQUIRE(Vulkan::CanDiscardPendingDraw(true, false, 7, 7, true));
+    REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 6, 100, true));
+    REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 0, 0, true));
+}

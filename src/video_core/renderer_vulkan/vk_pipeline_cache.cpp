@@ -1095,11 +1095,16 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
+    // EDEN_NX2_ASYNC_SKIP=0: native (Switch 2) draws wait for their pipeline to build.
+    static const bool skip_native = [] {
+        const char* const value = std::getenv("EDEN_NX2_ASYNC_SKIP");
+        return value == nullptr || value[0] != '0';
+    }();
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const bool discard = CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,
                                               maxwell3d->regs.zeta_enable != 0,
                                               draw_state.draw_element_count,
-                                              draw_state.draw_element_count);
+                                              draw_state.draw_element_count, skip_native);
     return discard ? nullptr : pipeline;
 }
 
