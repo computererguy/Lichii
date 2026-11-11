@@ -18,6 +18,7 @@
 #include "common/error.h"
 #include "common/event_wait.h"
 #include "common/logging.h"
+#include "common/nx2_sample_profile.h"
 #include "common/assert.h"
 #include "common/thread.h"
 #ifdef __APPLE__
@@ -681,6 +682,7 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 }
 
 void SetCurrentThreadName(const char* name) {
+    Nx2SampleProfile::OnThreadNamed(name);
 #ifdef _WIN32
     // Sets the debugger-visible name of the current thread (Windows 10+). Looked up at run time,
     // which also covers MinGW, whose headers may not declare it.
