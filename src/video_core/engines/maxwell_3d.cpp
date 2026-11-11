@@ -578,6 +578,12 @@ void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_cal
         }
         return;
     }
+    // Executable methods that only store their value (IsStoreOnlyExecutable) skip an unchanged
+    // value like plain registers: Ocarina repeats them ~150,000 times a second.
+    if (SkipSameValueWrites() && regs.reg_array[method] == argument && IsStoreOnlyExecutable(method) &&
+        !draw_manager.HasDeferredDraw()) {
+        return;
+    }
     ProcessDirtyRegisters(method, argument);
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     if (method - cb_data < 16) {
