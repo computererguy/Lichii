@@ -90,11 +90,11 @@ ProcessMemoryUsage GetProcessMemoryUsage() {
         usage.working_set = counters.WorkingSetSize;
         usage.private_working_set = counters.PrivateWorkingSetSize;
     }
-    PERFORMANCE_INFORMATION performance{};
-    performance.cb = sizeof(performance);
-    if (GetPerformanceInfo(&performance, sizeof(performance))) {
-        usage.system_commit = u64{performance.CommitTotal} * performance.PageSize;
-        usage.system_commit_limit = u64{performance.CommitLimit} * performance.PageSize;
+    MEMORYSTATUSEX status{}; // GetPerformanceInfo is slow (hundreds of ms): see below
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        usage.system_commit = status.ullTotalPageFile - status.ullAvailPageFile;
+        usage.system_commit_limit = status.ullTotalPageFile;
     }
 #elif defined(__linux__)
     std::ifstream status{"/proc/self/status"};
@@ -115,12 +115,13 @@ ProcessMemoryUsage GetProcessMemoryUsage() {
 
 std::optional<u64> GetSystemCommitRoom() {
 #ifdef _WIN32
-    PERFORMANCE_INFORMATION performance{};
-    performance.cb = sizeof(performance);
-    if (GetPerformanceInfo(&performance, sizeof(performance))) {
-        const u64 limit = performance.CommitLimit;
-        const u64 committed = performance.CommitTotal;
-        return (committed < limit ? limit - committed : 0) * performance.PageSize;
+    // GlobalMemoryStatusEx, not GetPerformanceInfo: the latter walks every process and took
+    // 240-380 ms here, freezing emulation every 30 frames (texture cache budget check).
+    // ullAvailPageFile is the commit limit minus the committed charge.
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return status.ullAvailPageFile;
     }
 #endif
     return std::nullopt;
