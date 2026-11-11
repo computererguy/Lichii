@@ -117,7 +117,14 @@ enum class AcquireCheck {
 AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& stats = VideoCommon::g_acquire_stats;
-    if (!acquire.WaitsToReach()) {
+    // Equal and mask acquires too, as in the old OoT fork (6708ea7): Ocarina drained ~280,000
+    // of them a second. Only the last release the front queued to the word, or memory when none
+    // is queued, decides. EDEN_NX2_ACQUIRE_PEEK_ALL=0 drains them as upstream does.
+    static const bool peek_all = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_PEEK_ALL");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!acquire.WaitsToReach() && !peek_all) {
         VideoCommon::Count(stats.drain_operation);
         return AcquireCheck::Drain;
     }
