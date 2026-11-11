@@ -8,6 +8,7 @@
 #include <array>
 #include <bit>
 #include <climits>
+#include <cstdlib>
 
 #include <boost/container/static_vector.hpp>
 
@@ -106,6 +107,17 @@ Id DefineVariable(EmitContext& ctx, Id type, std::optional<spv::BuiltIn> builtin
     const Id id{ctx.AddGlobalVariable(pointer_type, storage_class, initializer)};
     if (builtin) {
         ctx.Decorate(id, spv::Decoration::BuiltIn, *builtin);
+        // A depth prepass and a colour pass that tests EQUAL against it only match when both
+        // pipelines compute the position bit for bit (Ocarina of Time's white leaf holes on
+        // NVIDIA). EDEN_NX2_POSITION_INVARIANT=0 turns it off.
+        static const bool invariant_position = [] {
+            const char* const value = std::getenv("EDEN_NX2_POSITION_INVARIANT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (invariant_position && *builtin == spv::BuiltIn::Position &&
+            storage_class == spv::StorageClass::Output) {
+            ctx.Decorate(id, spv::Decoration::Invariant);
+        }
     }
     ctx.interfaces.push_back(id);
     return id;

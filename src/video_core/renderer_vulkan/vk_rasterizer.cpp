@@ -815,9 +815,13 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-        if (seen.size() < 64 && seen.emplace(vs, ps, reason).second) {
-            LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,
-                        regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
+        if (seen.size() < 400 && seen.emplace(vs, ps, reason).second) {
+            LOG_WARNING(HW_GPU,
+                        "Draw skipped ({}): frame={} vs={:#x} ps={:#x} rt0={:#x} {}x{} depth test={} "
+                        "func={:#x} write={}",
+                        reason, render_trace_frame, vs, ps, regs.rt[0].Address(), regs.rt[0].width,
+                        regs.rt[0].height, regs.zeta_enable != 0 && regs.depth_test_enable != 0,
+                        static_cast<u32>(regs.depth_test_func), regs.depth_write_enabled != 0);
         }
     };
     GraphicsPipeline* const delta_pipeline =
