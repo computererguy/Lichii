@@ -13,6 +13,7 @@
 #include <span>
 #include <string>
 #include <cstdlib>
+#include <string_view>
 #include <cstdio>
 #include <initializer_list>
 #include <limits>
@@ -3025,7 +3026,13 @@ private:
     // (m_mutex held). Returns true when the only frame left is late and more input is queued:
     // decode on before filling an image.
     bool DropOvertakenFrames() {
-        if (m_decoded.empty()) {
+        // Off by default in this fork: dropping makes movies (Ocarina's intro) visibly stutter
+        // when the game draws below the movie's rate. EDEN_NX2_VIDEO_DROP_LATE=1 restores it.
+        static const bool drop_late = [] {
+            const char* value = std::getenv("EDEN_NX2_VIDEO_DROP_LATE");
+            return value != nullptr && std::string_view{value} == "1";
+        }();
+        if (!drop_late || m_decoded.empty()) {
             return false;
         }
         const auto due = m_clock.Due(HostTimeUs(), PauseEndUs());
